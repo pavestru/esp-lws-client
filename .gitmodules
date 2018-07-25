@@ -1,3 +1,6 @@
 [submodule "components/libwebsockets"]
 	path = components/libwebsockets
 	url = https://github.com/warmcat/libwebsockets.git
+[submodule "components/zlib"]
+	path = components/zlib
+	url = https://github.com/pavestru/esp-zlib
