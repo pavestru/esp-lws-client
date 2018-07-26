@@ -21,7 +21,9 @@
 
 #include <libwebsockets.h>
 #include <string.h>
-#include <signal.h>
+
+#include "nvs.h"
+#include "nvs_flash.h"
 
 #define LWS_PLUGIN_STATIC
 #include "protocol_lws_minimal_pmd_bulk.c"
@@ -64,58 +66,66 @@ static const struct lws_extension extensions[] = {
      "; client_max_window_bits"},
     {NULL, NULL, NULL /* terminator */}};
 
-void sigint_handler(int sig)
+esp_err_t event_handler(void *ctx, system_event_t *event)
 {
-  interrupted = 1;
+    /* deal with your own user events here first */
+
+    return lws_esp32_event_passthru(ctx, event);
 }
 
-int main(int argc, const char **argv)
+void lws_esp32_leds_timer_cb(TimerHandle_t th)
 {
-  struct lws_context_creation_info info;
-  struct lws_context *context;
-  const char *p;
-  int n = 0, logs = LLL_USER | LLL_ERR | LLL_WARN | LLL_NOTICE
-      /* for LLL_ verbosity above NOTICE to be built into lws,
+}
+
+void app_main()
+{
+    struct lws_context_creation_info info;
+    struct lws_context *context;
+    struct lws_vhost *vh;
+    nvs_handle nvh;
+    int n = 0, logs = LLL_USER | LLL_ERR | LLL_WARN | LLL_NOTICE
+        /* for LLL_ verbosity above NOTICE to be built into lws,
 			 * lws must have been configured and built with
 			 * -DCMAKE_BUILD_TYPE=DEBUG instead of =RELEASE */
-      /* | LLL_INFO */ /* | LLL_PARSER */ /* | LLL_HEADER */
-      /* | LLL_EXT */ /* | LLL_CLIENT */  /* | LLL_LATENCY */
-      /* | LLL_DEBUG */;
+        /* | LLL_INFO */ /* | LLL_PARSER */ /* | LLL_HEADER */
+        /* | LLL_EXT */ /* | LLL_CLIENT */  /* | LLL_LATENCY */
+        /* | LLL_DEBUG */;
 
-  signal(SIGINT, sigint_handler);
+    // Initialize NVS (non-volatile storage = sd card).
+    esp_err_t err = nvs_flash_init();
+    if (err == ESP_ERR_NVS_NO_FREE_PAGES)
+    {
+        ESP_ERROR_CHECK(nvs_flash_erase());
+        err = nvs_flash_init();
+    }
+    ESP_ERROR_CHECK(err);
 
-  if ((p = lws_cmdline_option(argc, argv, "-d")))
-    logs = atoi(p);
+    if (!nvs_open("esp-lws", NVS_READWRITE, &nvh))
+    {
+        nvs_set_str(nvh, "ssid", "ssid");
+        nvs_set_str(nvh, "password", "password");
+        nvs_commit(nvh);
+        nvs_close(nvh);
+    }
 
-  lws_set_log_level(logs, NULL);
-  lwsl_user("LWS minimal ws client + permessage-deflate + multifragment bulk message\n");
-  lwsl_user("   needs minimal-ws-server-pmd-bulk running to communicate with\n");
-  lwsl_user("   %s [-n (no exts)] [-c (compressible)]\n", argv[0]);
+    lws_esp32_wlan_config();
 
-  memset(&info, 0, sizeof info); /* otherwise uninitialized garbage */
-  info.port = CONTEXT_PORT_NO_LISTEN;
-  info.protocols = protocols;
-  info.pvo = &pvo;
-  if (!lws_cmdline_option(argc, argv, "-n"))
+    lws_set_log_level(logs, NULL);
+    lwsl_user("LWS minimal ws client + permessage-deflate + multifragment bulk message\n");
+    lwsl_user("   needs minimal-ws-server-pmd-bulk running to communicate with\n");
+
+    memset(&info, 0, sizeof info); /* otherwise uninitialized garbage */
+    info.port = CONTEXT_PORT_NO_LISTEN;
+    info.protocols = protocols;
+    info.pvo = &pvo;
     info.extensions = extensions;
-  info.pt_serv_buf_size = 32 * 1024;
+    info.pt_serv_buf_size = 32 * 1024;
 
-  if (lws_cmdline_option(argc, argv, "-c"))
-    options |= 1;
+    ESP_ERROR_CHECK(esp_event_loop_init(event_handler, NULL));
 
-  context = lws_create_context(&info);
-  if (!context)
-  {
-    lwsl_err("lws init failed\n");
-    return 1;
-  }
+    lws_esp32_wlan_start_station();
+    context = lws_esp32_init(&info, &vh);
 
-  while (n >= 0 && !interrupted)
-    n = lws_service(context, 1000);
-
-  lws_context_destroy(context);
-
-  lwsl_user("Completed %s\n", interrupted == 2 ? "OK" : "failed");
-
-  return interrupted != 2;
+    while (!lws_service(context, 50))
+        taskYIELD();
 }
