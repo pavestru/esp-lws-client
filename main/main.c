@@ -1,29 +1,30 @@
 /*
- * lws-minimal-ws-client-pmd-bulk
+ * ESP32 "Factory" WLAN Config + Factory Setup app
  *
- * Copyright (C) 2018 Andy Green <andy@warmcat.com>
+ * Copyright (C) 2017 Andy Green <andy@warmcat.com>
  *
- * This file is made available under the Creative Commons CC0 1.0
- * Universal Public Domain Dedication.
+ *  This library is free software; you can redistribute it and/or
+ *  modify it under the terms of the GNU Lesser General Public
+ *  License as published by the Free Software Foundation:
+ *  version 2.1 of the License.
  *
- * This demonstrates a ws client that sends bulk data in multiple
- * ws fragments, in a way compatible with per-message deflate.
+ *  This library is distributed in the hope that it will be useful,
+ *  but WITHOUT ANY WARRANTY; without even the implied warranty of
+ *  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
+ *  Lesser General Public License for more details.
  *
- * It shows how to send huge messages without needing a lot of memory.
- * 
- * Build and start the minimal-examples/ws-server/minmal-ws-server-pmd-bulk
- * example first.  Running this sends a large message to the server and
- * exits.
- *
- * If you give both sides the -n commandline option, it disables permessage-
- * deflate compression extension.
+ *  You should have received a copy of the GNU Lesser General Public
+ *  License along with this library; if not, write to the Free Software
+ *  Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston,
+ *  MA  02110-1301  USA
  */
-
 #include <libwebsockets.h>
-#include <string.h>
+#include <nvs_flash.h>
+#include "soc/ledc_reg.h"
+#include "driver/ledc.h"
 
-#include "nvs.h"
-#include "nvs_flash.h"
+static struct lws_context *context;
+static int id_flashes;
 
 #define LWS_PLUGIN_STATIC
 #include "protocol_lws_minimal_pmd_bulk.c"
@@ -66,30 +67,76 @@ static const struct lws_extension extensions[] = {
      "; client_max_window_bits"},
     {NULL, NULL, NULL /* terminator */}};
 
+void lws_esp32_leds_timer_cb(TimerHandle_t th)
+{
+    struct timeval t;
+    unsigned long r;
+    int div = 3 - (2 * !!lws_esp32.inet);
+    int base = 4096 * !lws_esp32.inet;
+
+    gettimeofday(&t, NULL);
+    r = ((t.tv_sec * 1000000) + t.tv_usec);
+
+    if (!id_flashes)
+        ledc_set_duty(LEDC_HIGH_SPEED_MODE, LEDC_CHANNEL_0,
+                      base + (lws_esp32_sine_interp(r / (1699 - (500 * !lws_esp32.inet))) / div));
+    else
+        ledc_set_duty(LEDC_HIGH_SPEED_MODE, LEDC_CHANNEL_0, lws_esp32_sine_interp(r / 333));
+
+    ledc_update_duty(LEDC_HIGH_SPEED_MODE, LEDC_CHANNEL_0);
+
+    if (id_flashes)
+    {
+        id_flashes++;
+        if (id_flashes == 500)
+            id_flashes = 0;
+    }
+}
+
 esp_err_t event_handler(void *ctx, system_event_t *event)
 {
-    /* deal with your own user events here first */
-
     return lws_esp32_event_passthru(ctx, event);
 }
 
-void lws_esp32_leds_timer_cb(TimerHandle_t th)
+#define GPIO_ID 23
+
+/*
+ * This is called when the user asks to "Identify physical device"
+ * he is configuring, by pressing the Identify button on the AP
+ * setup page for the device.
+ *
+ * It should do something device-specific that
+ * makes it easy to identify which physical device is being
+ * addressed, like flash an LED on the device on a timer for a
+ * few seconds.
+ */
+void lws_esp32_identify_physical_device(void)
 {
+    lwsl_notice("%s\n", __func__);
+
+    id_flashes = 1;
 }
 
-void app_main()
+void lws_esp32_button(int down)
 {
-    struct lws_context_creation_info info;
-    struct lws_context *context;
-    struct lws_vhost *vh;
+    lwsl_notice("button %d\n", down);
+    if (!context)
+        return;
+}
+
+void app_main(void)
+{
+    static struct lws_context_creation_info info;
     nvs_handle nvh;
-    int n = 0, logs = LLL_USER | LLL_ERR | LLL_WARN | LLL_NOTICE
-        /* for LLL_ verbosity above NOTICE to be built into lws,
-			 * lws must have been configured and built with
-			 * -DCMAKE_BUILD_TYPE=DEBUG instead of =RELEASE */
-        /* | LLL_INFO */ /* | LLL_PARSER */ /* | LLL_HEADER */
-        /* | LLL_EXT */ /* | LLL_CLIENT */  /* | LLL_LATENCY */
-        /* | LLL_DEBUG */;
+    struct lws_vhost *vh;
+    ledc_channel_config_t ledc_channel = {
+        .channel = LEDC_CHANNEL_0,
+        .duty = 8191,
+        .gpio_num = GPIO_ID,
+        .intr_type = LEDC_INTR_FADE_END,
+        .speed_mode = LEDC_HIGH_SPEED_MODE,
+        .timer_sel = LEDC_TIMER_0,
+    };
 
     // Initialize NVS (non-volatile storage = sd card).
     esp_err_t err = nvs_flash_init();
@@ -100,32 +147,32 @@ void app_main()
     }
     ESP_ERROR_CHECK(err);
 
-    if (!nvs_open("esp-lws", NVS_READWRITE, &nvh))
+    if (!nvs_open("lws-station", NVS_READWRITE, &nvh))
     {
-        nvs_set_str(nvh, "ssid", "ssid");
-        nvs_set_str(nvh, "password", "password");
+        nvs_set_str(nvh, "0ssid", "ssid");
+        nvs_set_str(nvh, "0password", "password");
         nvs_commit(nvh);
         nvs_close(nvh);
     }
 
-    lws_esp32_wlan_config();
+    ledc_channel_config(&ledc_channel);
 
-    lws_set_log_level(logs, NULL);
-    lwsl_user("LWS minimal ws client + permessage-deflate + multifragment bulk message\n");
-    lwsl_user("   needs minimal-ws-server-pmd-bulk running to communicate with\n");
+    lws_esp32_set_creation_defaults(&info);
 
-    memset(&info, 0, sizeof info); /* otherwise uninitialized garbage */
     info.port = CONTEXT_PORT_NO_LISTEN;
     info.protocols = protocols;
     info.pvo = &pvo;
     info.extensions = extensions;
     info.pt_serv_buf_size = 32 * 1024;
 
+    lws_esp32_wlan_config();
+
     ESP_ERROR_CHECK(esp_event_loop_init(event_handler, NULL));
 
     lws_esp32_wlan_start_station();
+    /* this configures the LED timer channel 0 and starts the fading cb */
     context = lws_esp32_init(&info, &vh);
 
-    while (!lws_service(context, 50))
+    while (!lws_service(context, 10))
         taskYIELD();
 }
